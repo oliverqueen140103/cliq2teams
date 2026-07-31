@@ -572,7 +572,8 @@ def find_chat(st: State, selector: str) -> Any:
 
 
 def import_chat_as_channel(gc: Any, st: State, cfg: dict[str, Any],
-                           selector: str, channel_name: str | None = None) -> int:
+                           selector: str, channel_name: str | None = None,
+                           team_key: str | None = None) -> int:
     """Import a DM or group chat into a Teams *channel* instead of a chat.
 
     This is the escape hatch for conversations Teams cannot represent as a chat
@@ -581,15 +582,24 @@ def import_chat_as_channel(gc: Any, st: State, cfg: dict[str, Any],
     the history survives with real timestamps even when no valid chat exists.
 
     The parent team has usually had completeMigration called on it already, so
-    the channel is created normally and then reopened with startMigration."""
+    the channel is created normally and then reopened with startMigration.
+    Pass team_key to target a specific planned team (by teams_.team_key); when
+    that team is still in migration mode the channel is created in migration
+    mode instead."""
     chat = find_chat(st, selector)
     cid = chat["zoho_chat_id"]
     headroom = cfg["teams"]["backdate_headroom_hours"]
 
-    team = st.one("SELECT * FROM teams_ WHERE teams_team_id IS NOT NULL")
-    if not team:
-        raise RuntimeError("no Team exists yet -- run load-teams first")
+    if team_key:
+        team = st.one("SELECT * FROM teams_ WHERE team_key=?", (team_key,))
+        if not team:
+            raise RuntimeError(f"team {team_key!r} not planned -- create it first")
+    else:
+        team = st.one("SELECT * FROM teams_ WHERE teams_team_id IS NOT NULL")
+        if not team:
+            raise RuntimeError("no Team exists yet -- run load-teams first")
     team_id = team["teams_team_id"]
+    in_migration = team["migration_done"] == 0
 
     orphan_upn = cfg["mapping"].get("orphan_author_upn")
     orphan = gc.find_user(orphan_upn) if orphan_upn else None
@@ -599,13 +609,21 @@ def import_chat_as_channel(gc: Any, st: State, cfg: dict[str, Any],
     if not chan_id:
         name = channel_name or f"{chat['title'] or cid} (archive)"
         name = re.sub(r'[#%&*{}/\\:<>?+|"`]', "", name)[:50].rstrip()
-        chan_id = gc.create_plain_channel(
-            team_id, name, f"Imported from Zoho Cliq: {chat['title']}")
-        st.mark("chats", "zoho_chat_id", cid, chat["status"],
-                teams_team_id=team_id, teams_channel_id=chan_id)
-        log.info("channel %r created", name)
+        desc = f"Imported from Zoho Cliq: {chat['title']}"
+        if in_migration:
+            chan_id = gc.create_channel_migration(
+                team_id, name, backdate(chat["first_msg_ts"], headroom), desc)
+            st.mark("chats", "zoho_chat_id", cid, chat["status"],
+                    teams_team_id=team_id, teams_channel_id=chan_id,
+                    chat_migration="channel_started")
+            log.info("channel %r created in migration mode", name)
+        else:
+            chan_id = gc.create_plain_channel(team_id, name, desc)
+            st.mark("chats", "zoho_chat_id", cid, chat["status"],
+                    teams_team_id=team_id, teams_channel_id=chan_id)
+            log.info("channel %r created", name)
 
-    if chat["chat_migration"] != "channel_started":
+    if not in_migration and chat["chat_migration"] != "channel_started":
         created = backdate(chat["first_msg_ts"], headroom)
         gc.start_channel_migration(team_id, chan_id, created)
         st.mark("chats", "zoho_chat_id", cid, chat["status"],
