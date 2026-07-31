@@ -1,0 +1,171 @@
+"""CLI entrypoint. Every subcommand is independently re-runnable."""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+import yaml
+from dotenv import load_dotenv
+
+from . import transform, zoho  # graph imported lazily: msal not needed for extract
+from .state import State
+
+
+def setup(cfg_path: str) -> tuple[dict, State]:
+    load_dotenv()
+    cfg = yaml.safe_load(Path(cfg_path).read_text(encoding="utf-8"))
+    for key in ("raw_dir", "blob_dir", "report_dir"):
+        Path(cfg["paths"][key]).mkdir(parents=True, exist_ok=True)
+    st = State(cfg["paths"]["state_db"])
+    return cfg, st
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+    ap = argparse.ArgumentParser(prog="c2t", description="Zoho Cliq -> Microsoft Teams migration")
+    ap.add_argument("-c", "--config", default="config.yaml")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for c in ("init", "extract-users", "extract-chats", "extract-messages",
+              "extract-files", "map-users", "plan", "load-teams", "load-messages",
+              "export-dms", "complete", "verify", "status"):
+        sub.add_parser(c)
+    r = sub.add_parser("run", help="run a whole phase group unattended")
+    r.add_argument("--phase", choices=["extract", "load", "all"], default="extract")
+    r.add_argument("--yes", action="store_true",
+                   help="proceed through the irreversible completeMigration gate")
+    r.add_argument("--log-file", default=None)
+    d = sub.add_parser("dump", help="write extracted data to disk")
+    d.add_argument("--format", choices=["jsonl", "json"], default="jsonl")
+    p = sub.add_parser("probe", help="dump one raw page from an endpoint")
+    p.add_argument("endpoint", nargs="?", default="all",
+                   help="channels | chats | users | all")
+
+    args = ap.parse_args(argv)
+    cfg, st = setup(args.config)
+    cmd = args.cmd
+
+    if cmd == "init":
+        print(f"state initialised at {cfg['paths']['state_db']}")
+
+    elif cmd == "run":
+        from . import orchestrate
+        if args.log_file:
+            fh = logging.FileHandler(args.log_file, encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+            logging.getLogger().addHandler(fh)
+        try:
+            if args.phase in ("extract", "all"):
+                orchestrate.run_extract(cfg, st)
+            if args.phase in ("load", "all"):
+                orchestrate.run_load(cfg, st, assume_yes=args.yes)
+        except orchestrate.GateFailure as e:
+            print(f"\nGATE: {e}", file=sys.stderr)
+            return 2
+        print("\n" + json.dumps(st.counts(), indent=2))
+
+    elif cmd == "dump":
+        n = transform.dump(st, cfg, args.format)
+        print(f"{n} messages written to {cfg['paths']['raw_dir']}")
+
+    elif cmd == "probe":
+        zc = zoho.ZohoClient(cfg)
+        out = Path(cfg["paths"]["report_dir"])
+        names = (["channels", "chats", "messages", "users"]
+                 if args.endpoint == "all" else [args.endpoint])
+        for name in names:
+            try:
+                zoho.probe(zc, name, out)
+            except Exception as e:
+                import traceback
+                print(f"\n=== {name}  ->  FAILED: {type(e).__name__}: {e}")
+                traceback.print_exc()
+
+    elif cmd.startswith("extract"):
+        zc = zoho.ZohoClient(cfg)
+        if cmd == "extract-users":
+            print(f"{zoho.extract_users(zc, st)} users")
+        elif cmd == "extract-chats":
+            print(f"{zoho.extract_chats(zc, st)} chats")
+        elif cmd == "extract-messages":
+            print(f"{zoho.extract_messages(zc, st)} messages")
+        elif cmd == "extract-files":
+            print(f"{zoho.extract_files(zc, st, Path(cfg['paths']['blob_dir']))} files")
+
+    elif cmd == "map-users":
+        from . import graph
+        gc = graph.GraphClient(cfg)
+        mapped, unmapped = graph.map_users(gc, st, cfg)
+        print(f"mapped={mapped} unmapped={unmapped}")
+        if unmapped:
+            print(f"fix {cfg['paths']['report_dir']}/users_unmapped.csv, "
+                  f"switch mapping.strategy to csv, and re-run", file=sys.stderr)
+
+    elif cmd == "plan":
+        plans = transform.plan(st, cfg)
+        out = Path(cfg["paths"]["report_dir"]) / "plan.json"
+        out.write_text(json.dumps(plans, indent=2), encoding="utf-8")
+        for p in plans:
+            total = sum(c["messages"] for c in p["channels"])
+            print(f"\nTEAM  {p['team_key']}  (created {p['team_created']})")
+            for c in p["channels"]:
+                print(f"  ├─ {c['title'][:44]:<44} {c['messages']:>7} msgs")
+            print(f"  └─ {len(p['channels'])} channels, {total} messages")
+        bad = st.one("SELECT COUNT(*) n FROM users WHERE status='unmapped'")
+        if bad and bad["n"]:
+            print(f"\n!! {bad['n']} unmapped users — resolve before load", file=sys.stderr)
+            return 1
+        print(f"\nplan written to {out}")
+
+    elif cmd == "load-teams":
+        from . import graph
+        gc = graph.GraphClient(cfg)
+        transform.create_containers(gc, st, cfg)
+        print("teams and channels created in migration mode")
+
+    elif cmd == "load-messages":
+        from . import graph
+        gc = graph.GraphClient(cfg)
+        print(f"{graph.load_messages(gc, st, cfg)} messages imported")
+
+    elif cmd == "export-dms":
+        print(f"{transform.export_dms(st, cfg)} DM/group transcripts exported")
+
+    elif cmd == "complete":
+        from . import graph
+        gc = graph.GraphClient(cfg)
+        graph.complete_migration(gc, st)
+        print("migration completed; teams are now writable")
+
+    elif cmd == "verify":
+        from . import graph
+        gc = graph.GraphClient(cfg)
+        rows = st.rows("SELECT * FROM chats WHERE teams_channel_id IS NOT NULL")
+        bad = 0
+        print(f"{'channel':<40}{'source':>9}{'teams':>9}{'delta':>8}")
+        for c in rows:
+            src = st.one(
+                "SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=? AND status='done'",
+                (c["zoho_chat_id"],))["n"]
+            dst = gc.count_channel_messages(c["teams_team_id"], c["teams_channel_id"])
+            delta = dst - src
+            bad += delta != 0
+            print(f"{(c['title'] or '')[:39]:<40}{src:>9}{dst:>9}{delta:>8}")
+        print(f"\n{len(rows)} channels, {bad} with a non-zero delta")
+        return 1 if bad else 0
+
+    elif cmd == "status":
+        print(json.dumps(st.counts(), indent=2))
+
+    st.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

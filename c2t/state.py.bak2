@@ -1,0 +1,224 @@
+"""SQLite-backed run state. Everything that can fail gets a row and a status.
+
+Statuses: pending -> in_progress -> done | failed | skipped
+
+A phase is resumable because it only ever selects rows that are not `done`.
+Re-running after a crash is safe and cheap.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS users (
+    zoho_id       TEXT PRIMARY KEY,
+    zoho_email    TEXT,
+    display_name  TEXT,
+    aad_id        TEXT,
+    aad_upn       TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    note          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS chats (
+    zoho_chat_id     TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,          -- channel | dm | group
+    title            TEXT,
+    unique_name      TEXT,
+    member_count     INTEGER,
+    first_msg_ts     INTEGER,                -- epoch ms, filled during extract
+    last_msg_ts      INTEGER,
+    msg_count_src    INTEGER DEFAULT 0,
+    team_key         TEXT,                   -- grouping key -> teams.team_key
+    teams_team_id    TEXT,
+    teams_channel_id TEXT,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    note             TEXT
+);
+
+CREATE TABLE IF NOT EXISTS teams_ (
+    team_key       TEXT PRIMARY KEY,
+    display_name   TEXT NOT NULL,
+    created_dt     TEXT,                     -- ISO8601 backdated
+    teams_team_id  TEXT,
+    migration_done INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    note           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    zoho_msg_id    TEXT PRIMARY KEY,
+    zoho_chat_id   TEXT NOT NULL,
+    parent_msg_id  TEXT,                     -- for threaded replies
+    ts             INTEGER NOT NULL,         -- epoch ms
+    author_zoho_id TEXT,
+    payload        TEXT NOT NULL,            -- normalized JSON
+    teams_msg_id   TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    error          TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_msg_chat_ts ON messages(zoho_chat_id, ts);
+CREATE INDEX IF NOT EXISTS ix_msg_status  ON messages(status);
+
+CREATE TABLE IF NOT EXISTS files (
+    zoho_file_id  TEXT PRIMARY KEY,
+    zoho_chat_id  TEXT NOT NULL,
+    zoho_msg_id   TEXT,
+    name          TEXT,
+    size          INTEGER,
+    local_path    TEXT,
+    sha256        TEXT,
+    sp_item_id    TEXT,                      -- SharePoint driveItem id
+    sp_etag_guid  TEXT,                      -- used as attachment id
+    sp_web_url    TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    error         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_file_msg ON files(zoho_msg_id);
+
+CREATE TABLE IF NOT EXISTS events (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     INTEGER NOT NULL,
+    phase  TEXT,
+    level  TEXT,
+    msg    TEXT
+);
+"""
+
+
+class State:
+    def __init__(self, path: str | Path):
+        self.path = str(path)
+        self.db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(SCHEMA)
+
+    # ---------- plumbing ----------
+
+    @contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        self.db.execute("BEGIN")
+        try:
+            yield self.db
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def log(self, phase: str, level: str, msg: str) -> None:
+        self.db.execute(
+            "INSERT INTO events(ts, phase, level, msg) VALUES (?,?,?,?)",
+            (int(time.time() * 1000), phase, level, msg),
+        )
+
+    # ---------- upserts ----------
+
+    def upsert_user(self, zoho_id: str, email: str | None, name: str | None) -> None:
+        self.db.execute(
+            """INSERT INTO users(zoho_id, zoho_email, display_name)
+               VALUES (?,?,?)
+               ON CONFLICT(zoho_id) DO UPDATE SET
+                 zoho_email=excluded.zoho_email,
+                 display_name=excluded.display_name""",
+            (zoho_id, email, name),
+        )
+
+    def set_user_mapping(self, zoho_id: str, aad_id: str | None,
+                         aad_upn: str | None, status: str, note: str = "") -> None:
+        self.db.execute(
+            "UPDATE users SET aad_id=?, aad_upn=?, status=?, note=? WHERE zoho_id=?",
+            (aad_id, aad_upn, status, note, zoho_id),
+        )
+
+    def upsert_chat(self, chat_id: str, kind: str, title: str | None,
+                    unique_name: str | None = None, member_count: int | None = None) -> None:
+        self.db.execute(
+            """INSERT INTO chats(zoho_chat_id, kind, title, unique_name, member_count)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(zoho_chat_id) DO UPDATE SET
+                 kind=excluded.kind, title=excluded.title,
+                 unique_name=excluded.unique_name,
+                 member_count=excluded.member_count""",
+            (chat_id, kind, title, unique_name, member_count),
+        )
+
+    def upsert_message(self, msg_id: str, chat_id: str, ts: int,
+                       author: str | None, payload: dict[str, Any],
+                       parent: str | None = None) -> None:
+        self.db.execute(
+            """INSERT INTO messages(zoho_msg_id, zoho_chat_id, parent_msg_id,
+                                    ts, author_zoho_id, payload)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(zoho_msg_id) DO UPDATE SET
+                 payload=excluded.payload, ts=excluded.ts,
+                 parent_msg_id=excluded.parent_msg_id""",
+            (msg_id, chat_id, parent, ts, author, json.dumps(payload, ensure_ascii=False)),
+        )
+
+    def upsert_file(self, file_id: str, chat_id: str, msg_id: str | None,
+                    name: str | None, size: int | None) -> None:
+        self.db.execute(
+            """INSERT INTO files(zoho_file_id, zoho_chat_id, zoho_msg_id, name, size)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(zoho_file_id) DO NOTHING""",
+            (file_id, chat_id, msg_id, name, size),
+        )
+
+    # ---------- status transitions ----------
+
+    def mark(self, table: str, pk_col: str, pk: str, status: str,
+             error: str | None = None, **fields: Any) -> None:
+        sets = ["status=?"]
+        vals: list[Any] = [status]
+        if error is not None:
+            sets.append("error=?")
+            vals.append(error[:2000])
+        for k, v in fields.items():
+            sets.append(f"{k}=?")
+            vals.append(v)
+        vals.append(pk)
+        self.db.execute(
+            f"UPDATE {table} SET {', '.join(sets)} WHERE {pk_col}=?", vals
+        )
+
+    def bump_attempts(self, table: str, pk_col: str, pk: str) -> None:
+        self.db.execute(f"UPDATE {table} SET attempts=attempts+1 WHERE {pk_col}=?", (pk,))
+
+    # ---------- queries ----------
+
+    def rows(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        return self.db.execute(sql, tuple(params)).fetchall()
+
+    def one(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
+        return self.db.execute(sql, tuple(params)).fetchone()
+
+    def pending_messages(self, chat_id: str, limit: int = 500) -> list[sqlite3.Row]:
+        """Ordered by timestamp — required so replies find their parent."""
+        return self.rows(
+            """SELECT * FROM messages
+               WHERE zoho_chat_id=? AND status NOT IN ('done','skipped')
+               ORDER BY ts ASC, zoho_msg_id ASC LIMIT ?""",
+            (chat_id, limit),
+        )
+
+    def counts(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for t in ("users", "chats", "teams_", "messages", "files"):
+            out[t] = {
+                r["status"]: r["n"]
+                for r in self.rows(f"SELECT status, COUNT(*) n FROM {t} GROUP BY status")
+            }
+        return out
+
+    def close(self) -> None:
+        self.db.close()

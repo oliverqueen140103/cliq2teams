@@ -1,0 +1,362 @@
+"""Microsoft Graph load phase — Teams import ("migration") mode.
+
+The whole feature hinges on three things:
+
+  1. Create the team with `@microsoft.graph.teamCreationMode: migration` and an
+     explicit backdated `createdDateTime`.
+  2. Create channels the same way, then POST messages carrying their original
+     `createdDateTime` and `from.user`.
+  3. Call `completeMigration` on every channel, then on the team, then add
+     members. Members cannot be added while the team is locked.
+
+Ordering rule enforced everywhere below:
+    team.created <= channel.created <= min(message.created)
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import msal
+import requests
+
+from .http import ApiError, HttpClient
+from .state import State
+
+log = logging.getLogger(__name__)
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+SCOPE = ["https://graph.microsoft.com/.default"]
+LARGE_FILE_THRESHOLD = 4 * 1024 * 1024
+
+
+class GraphAuth:
+    def __init__(self) -> None:
+        self.app = msal.ConfidentialClientApplication(
+            client_id=os.environ["MS_CLIENT_ID"],
+            client_credential=os.environ["MS_CLIENT_SECRET"],
+            authority=f"https://login.microsoftonline.com/{os.environ['MS_TENANT_ID']}",
+        )
+        self._token: str | None = None
+        self._exp = 0.0
+        self._lock = threading.Lock()
+
+    def header(self) -> dict[str, str]:
+        with self._lock:
+            if not self._token or time.time() > self._exp - 120:
+                res = self.app.acquire_token_for_client(scopes=SCOPE)
+                if "access_token" not in res:
+                    raise RuntimeError(f"Graph auth failed: {res}")
+                self._token = res["access_token"]
+                self._exp = time.time() + int(res.get("expires_in", 3600))
+            return {"Authorization": f"Bearer {self._token}"}
+
+
+class GraphClient:
+    def __init__(self, cfg: dict[str, Any]):
+        self.cfg = cfg
+        self.auth = GraphAuth()
+        self.http = HttpClient(
+            GRAPH,
+            self.auth.header,
+            rate_per_sec=cfg["graph"].get("rate_limit_rps", 4.0),
+            max_retries=cfg["graph"].get("max_retries", 8),
+        )
+
+    # ---- users -----------------------------------------------------------
+
+    def find_user(self, email: str) -> dict[str, Any] | None:
+        esc = email.replace("'", "''")
+        body = self.http.get(
+            "/users",
+            params={"$filter": f"mail eq '{esc}' or userPrincipalName eq '{esc}'",
+                    "$select": "id,displayName,userPrincipalName,mail"},
+        )
+        vals = body.get("value") or []
+        return vals[0] if vals else None
+
+    # ---- team / channel creation (migration mode) -------------------------
+
+    def create_team_migration(self, display_name: str, created_dt: str,
+                              description: str = "") -> str:
+        resp = self.http.post("/teams", json={
+            "@microsoft.graph.teamCreationMode": "migration",
+            "template@odata.bind": f"{GRAPH}/teamsTemplates('standard')",
+            "displayName": display_name,
+            "description": description or f"Migrated from Zoho Cliq",
+            "createdDateTime": created_dt,
+        })
+        # 202 Accepted; the team id is in the Location header
+        loc = resp.headers.get("Location", "")
+        m = re.search(r"teams\('([^']+)'\)", loc) or re.search(r"/teams/([0-9a-fA-F-]{36})", loc)
+        if not m:
+            raise RuntimeError(f"Could not parse team id from Location: {loc!r}")
+        team_id = m.group(1)
+        self._await_team(team_id)
+        return team_id
+
+    def _await_team(self, team_id: str, timeout: int = 600) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.http.get(f"/teams/{team_id}")
+                return
+            except ApiError as e:
+                if e.status not in (404, 409):
+                    raise
+            time.sleep(5)
+        raise TimeoutError(f"team {team_id} did not provision within {timeout}s")
+
+    def create_channel_migration(self, team_id: str, display_name: str,
+                                 created_dt: str, description: str = "") -> str:
+        resp = self.http.post(f"/teams/{team_id}/channels", json={
+            "@microsoft.graph.channelCreationMode": "migration",
+            "displayName": display_name[:50],
+            "description": description[:1024],
+            "createdDateTime": created_dt,
+        })
+        return resp.json()["id"]
+
+    # ---- files -----------------------------------------------------------
+
+    def channel_files_folder(self, team_id: str, channel_id: str) -> tuple[str, str]:
+        """Returns (drive_id, folder_item_id). First call also provisions it."""
+        for attempt in range(6):
+            try:
+                body = self.http.get(f"/teams/{team_id}/channels/{channel_id}/filesFolder")
+                return body["parentReference"]["driveId"], body["id"]
+            except ApiError as e:
+                if e.status not in (404, 503):
+                    raise
+                time.sleep(5 * (attempt + 1))
+        raise RuntimeError("filesFolder never provisioned")
+
+    def upload_file(self, drive_id: str, folder_id: str, name: str,
+                    local_path: Path) -> dict[str, Any]:
+        size = local_path.stat().st_size
+        safe = re.sub(r'[<>:"/\\|?*]', "_", name)[:250]
+
+        if size <= LARGE_FILE_THRESHOLD:
+            with open(local_path, "rb") as fh:
+                resp = self.http.request(
+                    "PUT",
+                    f"/drives/{drive_id}/items/{folder_id}:/{safe}:/content",
+                    data=fh.read(),
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+            return resp.json()
+
+        # resumable upload session for >4 MB
+        sess = self.http.post(
+            f"/drives/{drive_id}/items/{folder_id}:/{safe}:/createUploadSession",
+            json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+        ).json()
+        url = sess["uploadUrl"]
+        chunk = 5 * 1024 * 1024  # must be a multiple of 320 KiB
+        with open(local_path, "rb") as fh:
+            pos = 0
+            while pos < size:
+                data = fh.read(chunk)
+                end = pos + len(data) - 1
+                r = requests.put(
+                    url, data=data, timeout=300,
+                    headers={"Content-Length": str(len(data)),
+                             "Content-Range": f"bytes {pos}-{end}/{size}"},
+                )
+                if r.status_code in (200, 201):
+                    return r.json()
+                if r.status_code != 202:
+                    raise ApiError(r.status_code, r.text, url)
+                pos = end + 1
+        raise RuntimeError("upload session ended without a completed item")
+
+    @staticmethod
+    def etag_guid(drive_item: dict[str, Any]) -> str:
+        """Reference attachments must use the driveItem's eTag GUID as their id."""
+        etag = drive_item.get("eTag", "")
+        m = re.search(r"([0-9a-fA-F-]{36})", etag)
+        return m.group(1) if m else drive_item["id"]
+
+    # ---- message import ---------------------------------------------------
+
+    def import_message(self, team_id: str, channel_id: str, payload: dict[str, Any],
+                       reply_to: str | None = None) -> str:
+        path = (f"/teams/{team_id}/channels/{channel_id}/messages"
+                if not reply_to else
+                f"/teams/{team_id}/channels/{channel_id}/messages/{reply_to}/replies")
+        return self.http.post(path, json=payload).json()["id"]
+
+    # ---- completion -------------------------------------------------------
+
+    def complete_channel(self, team_id: str, channel_id: str) -> None:
+        self.http.post(f"/teams/{team_id}/channels/{channel_id}/completeMigration")
+
+    def complete_team(self, team_id: str) -> None:
+        self.http.post(f"/teams/{team_id}/completeMigration")
+
+    def add_member(self, team_id: str, aad_user_id: str, owner: bool = False) -> None:
+        self.http.post(f"/teams/{team_id}/members", json={
+            "@odata.type": "#microsoft.graph.aadUserConversationMember",
+            "roles": ["owner"] if owner else [],
+            "user@odata.bind": f"{GRAPH}/users('{aad_user_id}')",
+        })
+
+    def count_channel_messages(self, team_id: str, channel_id: str) -> int:
+        n = 0
+        url = f"/teams/{team_id}/channels/{channel_id}/messages?$top=50"
+        while url:
+            body = self.http.get(url)
+            n += len(body.get("value", []))
+            url = body.get("@odata.nextLink")
+        return n
+
+
+# --------------------------------------------------------------------------
+# Load phases
+# --------------------------------------------------------------------------
+
+def map_users(gc: GraphClient, st: State, cfg: dict[str, Any]) -> tuple[int, int]:
+    """Resolve every Zoho user to an AAD user. Unmapped users are written to a
+    CSV for manual correction — never guessed at."""
+    import csv
+
+    strategy = cfg["mapping"]["strategy"]
+    manual: dict[str, str] = {}
+    if strategy == "csv":
+        with open("mapping/users.csv", newline="", encoding="utf-8") as fh:
+            manual = {r["zoho_email"].lower(): r["aad_upn"] for r in csv.DictReader(fh)}
+
+    mapped = unmapped = 0
+    rows = st.rows("SELECT * FROM users WHERE status != 'mapped'")
+    report = Path(cfg["paths"]["report_dir"]) / "users_unmapped.csv"
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(report, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["zoho_id", "zoho_email", "display_name", "reason"])
+        for u in rows:
+            email = (u["zoho_email"] or "").strip().lower()
+            target = manual.get(email, email)
+            if not target:
+                w.writerow([u["zoho_id"], "", u["display_name"], "no email in Cliq"])
+                st.set_user_mapping(u["zoho_id"], None, None, "unmapped", "no email")
+                unmapped += 1
+                continue
+            aad = gc.find_user(target)
+            if aad:
+                st.set_user_mapping(u["zoho_id"], aad["id"],
+                                    aad["userPrincipalName"], "mapped")
+                mapped += 1
+            else:
+                w.writerow([u["zoho_id"], email, u["display_name"], "not found in AAD"])
+                st.set_user_mapping(u["zoho_id"], None, None, "unmapped", "not in AAD")
+                unmapped += 1
+    log.info("mapped=%d unmapped=%d (see %s)", mapped, unmapped, report)
+    return mapped, unmapped
+
+
+def load_messages(gc: GraphClient, st: State, cfg: dict[str, Any]) -> int:
+    """Import messages channel by channel, strictly in timestamp order so that
+    replies always find an already-imported parent."""
+    from .transform import build_message_payload
+
+    orphan_upn = cfg["mapping"].get("orphan_author_upn")
+    orphan = gc.find_user(orphan_upn) if orphan_upn else None
+
+    total = 0
+    chats = st.rows(
+        "SELECT * FROM chats WHERE teams_channel_id IS NOT NULL AND kind='channel'"
+    )
+    for chat in chats:
+        team_id, chan_id = chat["teams_team_id"], chat["teams_channel_id"]
+        drive_id = folder_id = None
+
+        while True:
+            batch = st.pending_messages(chat["zoho_chat_id"], limit=200)
+            if not batch:
+                break
+            for row in batch:
+                mid = row["zoho_msg_id"]
+                st.bump_attempts("messages", "zoho_msg_id", mid)
+
+                if row["attempts"] >= 5:
+                    st.mark("messages", "zoho_msg_id", mid, "failed",
+                            error="max attempts exceeded")
+                    continue
+
+                # lazily provision the SharePoint folder only when needed
+                files = st.rows(
+                    "SELECT * FROM files WHERE zoho_msg_id=? AND status='done'", (mid,)
+                )
+                if files and drive_id is None:
+                    drive_id, folder_id = gc.channel_files_folder(team_id, chan_id)
+
+                uploaded = []
+                try:
+                    for f in files:
+                        if f["sp_etag_guid"]:
+                            uploaded.append(dict(f))
+                            continue
+                        item = gc.upload_file(
+                            drive_id, folder_id, f["name"] or f["zoho_file_id"],
+                            Path(f["local_path"]),
+                        )
+                        guid = gc.etag_guid(item)
+                        st.mark("files", "zoho_file_id", f["zoho_file_id"], "done",
+                                sp_item_id=item["id"], sp_etag_guid=guid,
+                                sp_web_url=item.get("webUrl"))
+                        uploaded.append({**dict(f), "sp_etag_guid": guid,
+                                         "sp_web_url": item.get("webUrl")})
+
+                    payload = build_message_payload(st, row, uploaded, orphan)
+                    parent_teams_id = None
+                    if row["parent_msg_id"]:
+                        p = st.one("SELECT teams_msg_id FROM messages WHERE zoho_msg_id=?",
+                                   (row["parent_msg_id"],))
+                        parent_teams_id = p["teams_msg_id"] if p else None
+
+                    new_id = gc.import_message(team_id, chan_id, payload, parent_teams_id)
+                    st.mark("messages", "zoho_msg_id", mid, "done", teams_msg_id=new_id)
+                    total += 1
+                except ApiError as e:
+                    st.mark("messages", "zoho_msg_id", mid, "pending", error=str(e))
+                    log.warning("msg %s failed: %s", mid, e)
+
+        log.info("channel %s complete", chat["title"])
+    return total
+
+
+def complete_migration(gc: GraphClient, st: State) -> None:
+    """Channels first, then the team, then members. This order is mandatory."""
+    for team in st.rows("SELECT * FROM teams_ WHERE migration_done=0 AND teams_team_id IS NOT NULL"):
+        tid = team["teams_team_id"]
+        for ch in st.rows(
+            "SELECT * FROM chats WHERE teams_team_id=? AND teams_channel_id IS NOT NULL", (tid,)
+        ):
+            stuck = st.one(
+                "SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=? AND status NOT IN ('done','skipped')",
+                (ch["zoho_chat_id"],),
+            )
+            if stuck and stuck["n"]:
+                log.error("refusing to complete %s: %d messages not imported",
+                          ch["title"], stuck["n"])
+                return
+            try:
+                gc.complete_channel(tid, ch["teams_channel_id"])
+            except ApiError as e:
+                if e.status not in (400, 409):   # already completed
+                    raise
+        gc.complete_team(tid)
+        st.mark("teams_", "team_key", team["team_key"], "done", migration_done=1)
+        log.info("team %s migration completed", team["display_name"])
+
+        for u in st.rows("SELECT * FROM users WHERE status='mapped' AND aad_id IS NOT NULL"):
+            try:
+                gc.add_member(tid, u["aad_id"])
+            except ApiError as e:
+                log.warning("add_member %s: %s", u["aad_upn"], e)

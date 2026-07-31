@@ -1,0 +1,69 @@
+zoho:
+  dc: in                 # com | eu | in | com.au | jp | ca
+  page_size: 100
+  rate_limit_rps: 0.3   # Be gentle to avoid 429s on file downloads
+  # Only extract these channels. Empty list = all.
+  include_channels: []
+  # #LEPU reports chat_id=null and 404s on the unique_name fallback; not wanted.
+  exclude_channels: ["#LEPU", "LEPU"]
+
+graph:
+  rate_limit_rps: 4.0
+  max_retries: 8
+  # Owner UPN applied to every created team (required by Teams).
+  default_owner_upn: varagunarajan@lifesigns.us
+
+mapping:
+  # How a Zoho user resolves to an AAD user.
+  # email        -> match Zoho email to AAD mail/UPN
+  # csv          -> read mapping/users.csv (zoho_email,aad_upn)
+  strategy: email
+  # Cliq identities live on lifesigns.in, the tenant on lifesigns.us. Tried in
+  # order after an exact match fails. Empty = exact match only.
+  domain_rewrite:
+    lifesigns.in: lifesigns.us
+  # Last resort: match on display name. Only accepted when exactly one enabled
+  # AAD user has that name.
+  match_display_name: true
+  # Fallback identity for messages whose author no longer exists in AAD.
+  # Set to null to hard-fail instead.
+  orphan_author_upn: varagunarajan@lifesigns.us
+
+teams:
+  # Channels are grouped into teams by this rule:
+  #   one_team   -> everything into a single team named `single_team_name`
+  #   by_prefix  -> split on the first `prefix_delimiter` in the channel name
+  grouping: one_team
+  single_team_name: "Zoho Cliq Archive"
+  prefix_delimiter: "-"
+  # Backdate containers this many hours before their earliest message.
+  backdate_headroom_hours: 24
+
+dms:
+  # none | html_export | teams_chats
+  #   html_export -> self-contained HTML transcripts (kept as the fallback record)
+  #   teams_chats -> real Teams 1:1 / group chats via chat migration mode
+  strategy: teams_chats
+  export_dir: ./out/dm_exports
+
+  # The account these DMs were exported from. Every 1:1 chat is created between
+  # this user and the other participant.
+  owner_upn: Varagunarajan@lifesigns.us
+
+  # Import the 4 multi-party Cliq group chats as Teams group chats too.
+  # Membership can only be reconstructed from who actually spoke, so this is
+  # lower fidelity than the 1:1 chats. See `plan-dms` output.
+  include_groups: true
+
+  # link -> upload the blob to the owner's OneDrive and attach it by reference
+  # none -> import the message text only, naming the file inline
+  attachments: link
+  onedrive_folder: "Cliq Archive"
+  # Skip anything larger than this (0 = no limit). The largest DM blob is 362 MB.
+  max_attachment_mb: 0
+
+paths:
+  state_db: ./state.db
+  raw_dir: ./out/raw          # extracted JSONL
+  blob_dir: ./out/blobs       # downloaded attachments
+  report_dir: ./out/reports
