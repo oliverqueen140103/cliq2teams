@@ -152,7 +152,9 @@ Running both is reasonable: the HTML transcript stays the fallback record.
 ### Microsoft side
 
 1. Entra ID app registration (single tenant).
-2. **Application** permissions (not delegated), all admin-consented:
+2. **Application** permissions, all admin-consented. The tool uses client
+   credentials — there is no signed-in user in it — so Delegated permissions of
+   the same name have no effect and only make the grant list harder to audit:
    ```
    Teamwork.Migrate.All                  backdated import; start/completeMigration
    Chat.Create                           creating 1:1 and group chats
@@ -171,6 +173,13 @@ Running both is reasonable: the HTML transcript stays the fallback record.
    read a chat back to check it, cannot see whether the conversation was actually
    backdated, and cannot fix hidden history (§1.2). An unverified migration is how
    you end up believing 18 months imported when the client shows three.
+   `Chat.ManageDeletion.All` is deliberately **not** on this list. It appears to
+   offer a way to clean up a duplicated import, but message deletion is
+   delegated-only: an app-only token gets `405` from
+   `POST /chats/{id}/messages/{id}/softDelete` and `412 "not supported in
+   application-only context"` from the `/users/{id}/chats/...` form, and
+   chat-level `softDelete` does not exist. A duplicate posted into a 1:1 chat is
+   permanent, so the loader reconciles against the destination before posting.
 3. Client secret or certificate. A secret is the **Value**, not the secret ID,
    and it expires — `AADSTS7000215` at startup means regenerate it.
 4. Teams licences assigned to every target user *before* load — messages

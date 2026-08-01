@@ -32,9 +32,12 @@ read at all. If you care about such a channel, **join it in Cliq first**, then r
 
 ## 2. Entra ID app permissions (one-time, done by an admin)
 
-The tenant app needs these **application** permissions, with admin consent:
+This tool authenticates with **client credentials** (app-only) — there is no signed-in
+user anywhere in it. So grant **Application** permissions only, each with admin
+consent. Delegated permissions of the same name do nothing here: they never appear in
+an app-only token, and granting them is noise that makes the real list harder to audit.
 
-| Permission | Needed for |
+| Application permission | Needed for |
 |---|---|
 | `Teamwork.Migrate.All` | importing backdated messages; `startMigration` / `completeMigration` |
 | `Chat.Create` | creating 1:1 and group chats |
@@ -51,8 +54,20 @@ Import itself only needs the first two plus the file and user permissions. Every
 else exists so you can **check** the result — and an unverified migration is how you
 end up believing 18 months imported when your client shows three.
 
+**Do not bother with `Chat.ManageDeletion.All`.** It looks like it would let you clean
+up duplicate imports; it does not. Deleting a chat message requires a signed-in user:
+an application-only token gets `405` from `POST /chats/{id}/messages/{id}/softDelete`
+and `412 "Requested API is not supported in application-only context"` from the
+`/users/{id}/chats/...` form. Chat-level `softDelete` does not exist at all
+(`Resource not found for the segment 'softDelete'`). A duplicated import into a 1:1
+chat is therefore **permanent** — which is why the loader now reconciles against the
+destination before posting. Never point a `state.db` at a chat it did not create.
+
 To see what the app is actually granted, decode the `roles` claim of a token rather
-than trusting the portal list; a 403 from Graph also names the roles on the request.
+than trusting the portal list — the portal shows Delegated and Application side by
+side, and only the Application ones reach the `roles` claim. A 403 from Graph also
+names the roles that were on the request, which is the fastest way to spot a
+permission that was granted as Delegated by mistake.
 
 Put `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET` in `.env`.
 `MS_CLIENT_SECRET` is the secret **Value**, not the secret ID. Secrets expire —
