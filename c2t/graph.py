@@ -185,10 +185,19 @@ class GraphClient:
                 if i == 0 and e.status in (404, 405, 501):
                     log.info("%s not available on v1.0; retrying on beta", action)
                     continue
-                # already in the requested state: idempotent, not an error
-                if e.status == 400 and "migration" in e.body.lower():
-                    log.info("chat %s: %s reports migration state already set",
-                             chat_id, action)
+                # Only a genuine "already in that state" is idempotent. This
+                # used to match any 400 containing "migration", which swallowed
+                # real completeMigration failures and left chats stuck in
+                # migration mode while state.db recorded them as completed —
+                # the Teams client then shows "Migration for this conversation
+                # is in progress" and refuses to render the full history.
+                body = e.body.lower()
+                already = ("already" in body
+                           or "not in migration" in body
+                           or "invalid state" in body)
+                if e.status == 400 and already:
+                    log.warning("chat %s: %s reports the state is already set "
+                                "(%s)", chat_id, action, e.body[:200])
                     return
                 raise
         if last:
@@ -428,13 +437,52 @@ class GraphClient:
         })
 
     def count_channel_messages(self, team_id: str, channel_id: str) -> int:
+        return self._message_stats(
+            f"/teams/{team_id}/channels/{channel_id}/messages?$top=50")[0]
+
+    def _message_stats(self, url: str) -> tuple[int, str | None, str | None]:
+        """(count, oldest createdDateTime, newest createdDateTime).
+
+        The dates are what prove a backdated import actually landed in the past
+        rather than at import time — a count alone cannot show that.
+        """
         n = 0
-        url = f"/teams/{team_id}/channels/{channel_id}/messages?$top=50"
+        oldest = newest = None
         while url:
             body = self.http.get(url)
-            n += len(body.get("value", []))
+            for m in body.get("value", []):
+                n += 1
+                dt = m.get("createdDateTime")
+                if not dt:
+                    continue
+                if oldest is None or dt < oldest:
+                    oldest = dt
+                if newest is None or dt > newest:
+                    newest = dt
             url = body.get("@odata.nextLink")
-        return n
+        return n, oldest, newest
+
+    def channel_message_stats(self, team_id: str,
+                              channel_id: str) -> tuple[int, str | None, str | None]:
+        return self._message_stats(
+            f"/teams/{team_id}/channels/{channel_id}/messages?$top=50")
+
+    def chat_message_stats(self, chat_id: str) -> tuple[int, str | None, str | None]:
+        return self._message_stats(f"/chats/{chat_id}/messages?$top=50")
+
+    def list_chat_messages(self, chat_id: str) -> list[dict[str, Any]]:
+        """Every message in a chat, tombstones excluded."""
+        out: list[dict[str, Any]] = []
+        url = f"/chats/{chat_id}/messages?$top=50"
+        while url:
+            body = self.http.get(url)
+            out += [m for m in body.get("value", []) if not m.get("deletedDateTime")]
+            url = body.get("@odata.nextLink")
+        return out
+
+    def soft_delete_chat_message(self, chat_id: str, message_id: str) -> None:
+        """Needs Chat.ManageDeletion.All. Recoverable via undoSoftDelete."""
+        self.http.post(f"/chats/{chat_id}/messages/{message_id}/softDelete")
 
 
 # --------------------------------------------------------------------------
@@ -564,22 +612,29 @@ def load_messages(gc: GraphClient, st: State, cfg: dict[str, Any]) -> int:
             batch = st.pending_messages(chat["zoho_chat_id"], limit=200)
             if not batch:
                 break
+            progressed = False
             for row in batch:
                 mid = row["zoho_msg_id"]
                 st.bump_attempts("messages", "zoho_msg_id", mid)
 
                 if not json.loads(row["payload"]).get("importable", True):
                     st.mark("messages", "zoho_msg_id", mid, "skipped")
+                    progressed = True
                     continue
 
                 if row["attempts"] >= 5:
                     st.mark("messages", "zoho_msg_id", mid, "failed",
                             error="max attempts exceeded")
+                    progressed = True
                     continue
 
-                # lazily provision the SharePoint folder only when needed
+                # Every attachment on this message, not just the ones already
+                # downloaded — a file left out here would vanish from the
+                # message with nothing recording the loss. There is no size cap:
+                # upload_file switches to a resumable session above 4 MB.
                 files = st.rows(
-                    "SELECT * FROM files WHERE zoho_msg_id=? AND status='done'", (mid,)
+                    "SELECT * FROM files WHERE zoho_msg_id=? AND status!='skipped'",
+                    (mid,),
                 )
                 if files and drive_id is None:
                     drive_id, folder_id = gc.channel_files_folder(team_id, chan_id)
@@ -590,9 +645,18 @@ def load_messages(gc: GraphClient, st: State, cfg: dict[str, Any]) -> int:
                         if f["sp_etag_guid"]:
                             uploaded.append(dict(f))
                             continue
+                        blob = Path(f["local_path"] or "")
+                        if not blob.exists():
+                            log.error("blob missing on disk for %s (%s) — "
+                                      "re-run extract-files",
+                                      f["name"], f["local_path"] or "never downloaded")
+                            st.mark("files", "zoho_file_id", f["zoho_file_id"],
+                                    "pending",
+                                    error="blob missing on disk; re-run extract-files")
+                            continue
                         item = gc.upload_file(
                             drive_id, folder_id, f["name"] or f["zoho_file_id"],
-                            Path(f["local_path"]),
+                            blob,
                         )
                         guid = gc.etag_guid(item)
                         st.mark("files", "zoho_file_id", f["zoho_file_id"], "done",
@@ -611,9 +675,16 @@ def load_messages(gc: GraphClient, st: State, cfg: dict[str, Any]) -> int:
                     new_id = gc.import_message(team_id, chan_id, payload, parent_teams_id)
                     st.mark("messages", "zoho_msg_id", mid, "done", teams_msg_id=new_id)
                     total += 1
+                    progressed = True
                 except ApiError as e:
                     st.mark("messages", "zoho_msg_id", mid, "pending", error=str(e))
                     log.warning("msg %s failed: %s", mid, e)
+
+            if not progressed:
+                log.error("channel %s: a batch of %d made no progress; stopping "
+                          "to avoid an endless retry loop",
+                          chat["title"], len(batch))
+                break
 
         log.info("channel %s complete", chat["title"])
     return total

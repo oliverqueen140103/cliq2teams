@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ from urllib.parse import quote
 
 from .http import ApiError
 from .state import State
-from .transform import backdate, build_message_payload, render_body
+from .transform import backdate, build_message_payload, iso, render_body
 
 log = logging.getLogger(__name__)
 
@@ -53,15 +54,7 @@ def importable_count(st: State, chat_id: str) -> int:
 
 
 def _pending(st: State, chat_id: str, limit: int = 200) -> list[Any]:
-    """Oldest first. Unlike State.pending_messages this treats 'failed' as
-    terminal — otherwise a row that exhausts its attempts is re-selected
-    forever and the batch loop never drains."""
-    return st.rows(
-        """SELECT * FROM messages
-           WHERE zoho_chat_id=? AND status NOT IN ('done','skipped','failed')
-           ORDER BY ts ASC, zoho_msg_id ASC LIMIT ?""",
-        (chat_id, limit),
-    )
+    return st.pending_messages(chat_id, limit)
 
 
 def owner_identity(gc: Any, st: State, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -206,15 +199,24 @@ def _upload_attachments(gc: Any, st: State, cfg: dict[str, Any], chat: Any,
                 log.info("repaired contentUrl for %s", row["name"])
             uploaded.append(row)
             continue
+        # max_attachment_mb: 0 means no limit, which is the default — Graph
+        # uploads arbitrarily large blobs through a resumable session.
         if limit_mb and (f["size"] or 0) > limit_mb * 1024 * 1024:
-            log.warning("skipping %s (%.1f MB > max_attachment_mb)",
-                        f["name"], (f["size"] or 0) / 1048576)
+            log.warning("DROPPING %s (%.1f MB) — over max_attachment_mb=%d. "
+                        "Set max_attachment_mb: 0 to import every file.",
+                        f["name"], (f["size"] or 0) / 1048576, limit_mb)
             st.mark("files", "zoho_file_id", f["zoho_file_id"], "skipped",
-                    error="over max_attachment_mb")
+                    error=f"over max_attachment_mb={limit_mb}")
             continue
         path = Path(f["local_path"] or "")
         if not path.exists():
-            log.warning("blob missing on disk: %s", f["local_path"])
+            # Do not let the message import without its attachment and leave no
+            # trace. Put the row back in the queue so extract-files re-downloads
+            # it, and make the gap visible in `status`.
+            log.error("blob missing on disk for %s (%s) — re-run extract-files",
+                      f["name"], f["local_path"] or "never downloaded")
+            st.mark("files", "zoho_file_id", f["zoho_file_id"], "pending",
+                    error="blob missing on disk; re-run extract-files")
             continue
 
         drive_id, drive_url, folder_id = _drive(gc, cfg, chat, owner_id, cache)
@@ -313,6 +315,30 @@ def load_dms(gc: Any, st: State, cfg: dict[str, Any],
         if remaining > 0:
             log.info("%s: importing %d messages (%d already done)",
                      chat["title"], remaining, chat_done)
+
+        # Reconcile against the DESTINATION, not just state.db.
+        #
+        # state.db is the only record of what has been posted, so a database
+        # that does not match the chat — a fresh one, a copy from another
+        # machine, or a run that posted but died before recording — makes the
+        # loader re-post everything. Teams accepts that happily (a re-post just
+        # gets a new id), and the conversation ends up holding two or three
+        # copies of itself. Chat messages cannot be deleted with an app-only
+        # token, so a duplicate is permanent: prevention is the only cure.
+        already: set[tuple] = set()
+        if remaining > 0:
+            try:
+                already = {(m.get("createdDateTime") or "")[:23]
+                           for m in gc.list_chat_messages(teams_chat_id)}
+                if already:
+                    log.info("%s: %d messages already in the destination; "
+                             "they will be skipped", chat["title"], len(already))
+            except ApiError as e:
+                log.warning("%s: cannot read the destination to check for "
+                            "duplicates (%s). Import will trust state.db — if "
+                            "that database did not create this chat, STOP and "
+                            "grant ChatMessage.Read.All first.",
+                            chat["title"], e.status)
         while True:
             batch = _pending(st, cid, limit=200)
             if not batch:
@@ -329,6 +355,14 @@ def load_dms(gc: Any, st: State, cfg: dict[str, Any],
                 if row["attempts"] >= 5:
                     st.mark("messages", "zoho_msg_id", mid, "failed",
                             error="max attempts exceeded")
+                    progressed = True
+                    continue
+
+                # Already in the destination -> record it and move on rather
+                # than posting a second copy that can never be deleted.
+                if already and iso(row["ts"])[:23] in already:
+                    st.mark("messages", "zoho_msg_id", mid, "done",
+                            error="already present in the destination")
                     progressed = True
                     continue
 
@@ -388,12 +422,24 @@ def load_dms(gc: Any, st: State, cfg: dict[str, Any],
     return total
 
 
-def complete_dms(gc: Any, st: State, assume_yes: bool = False) -> int:
-    """Take every fully-imported chat out of migration mode. Until this runs,
-    clients show the import banner and may not display every message."""
+def complete_dms(gc: Any, st: State, assume_yes: bool = False,
+                 force: bool = False) -> int:
+    """Take every fully-imported chat out of migration mode.
+
+    Until this runs, the Teams client shows "Migration for this conversation is
+    in progress" and will not render the full backdated history.
+
+    force=True re-issues completeMigration for chats this database already calls
+    'completed'. That is not paranoia: a swallowed error once left every chat
+    stuck in migration mode with state.db recording success, and the only way to
+    tell from outside is to call completeMigration and see whether it returns
+    204 (it was still open) or an already-completed error.
+    """
+    where = ("chat_migration='started'" if not force
+             else "chat_migration IN ('started','completed')")
     n = 0
     for chat in st.rows(
-        "SELECT * FROM chats WHERE teams_chat_id IS NOT NULL AND chat_migration='started'"
+        f"SELECT * FROM chats WHERE teams_chat_id IS NOT NULL AND {where}"
     ):
         stuck = st.one(
             "SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=?"
@@ -402,12 +448,190 @@ def complete_dms(gc: Any, st: State, assume_yes: bool = False) -> int:
             log.error("refusing to complete %s: %d messages not imported",
                       chat["title"], stuck)
             continue
-        gc.complete_chat_migration(chat["teams_chat_id"])
+        try:
+            gc.complete_chat_migration(chat["teams_chat_id"])
+        except ApiError as e:
+            log.error("%s: completeMigration FAILED — the chat is still in "
+                      "migration mode and Teams will not show its full "
+                      "history: %s", chat["title"], str(e)[:220])
+            st.mark("chats", "zoho_chat_id", chat["zoho_chat_id"], chat["status"],
+                    chat_migration="started",
+                    note=f"completeMigration failed: {str(e)[:250]}")
+            continue
         st.mark("chats", "zoho_chat_id", chat["zoho_chat_id"], chat["status"],
                 chat_migration="completed")
         log.info("%s: migration completed", chat["title"])
         n += 1
     return n
+
+
+def _dup_key(m: dict[str, Any]) -> tuple:
+    """Identity of a message for duplicate detection.
+
+    createdDateTime alone is too loose (a 409 retry legitimately nudges by 1 ms)
+    and the Teams id is useless because a re-post gets a fresh one. Author plus
+    exact body plus timestamp is what a human would call "the same message".
+    """
+    frm = ((m.get("from") or {}).get("user") or {}).get("id")
+    return (m.get("createdDateTime"), frm,
+            (m.get("body") or {}).get("content") or "")
+
+
+def dedupe_chats(gc: Any, st: State, only: str | None = None,
+                 dry_run: bool = True) -> int:
+    """Soft-delete duplicate copies left behind by repeated import runs.
+
+    A load that posts a message but does not record its teams_msg_id — or a load
+    driven by a state.db that does not match the destination — re-posts
+    everything on the next run. Teams accepts it: createdDateTime only has to be
+    unique to the millisecond, and a fresh post gets a fresh id, so the chat ends
+    up holding the same conversation two or three times over.
+
+    The oldest copy of each (timestamp, author, body) is kept and the rest are
+    soft-deleted, which is reversible via undoSoftDelete. Native Teams messages
+    are untouched: they are unique, so they never look like duplicates.
+    """
+    sql = "SELECT * FROM chats WHERE teams_chat_id IS NOT NULL"
+    params: list[Any] = []
+    if only:
+        sql += " AND (zoho_chat_id=? OR title=?)"
+        params += [only, only]
+
+    total = 0
+    for chat in st.rows(sql, tuple(params)):
+        cid = chat["teams_chat_id"]
+        try:
+            msgs = gc.list_chat_messages(cid)
+        except ApiError as e:
+            log.error("%-24s cannot read messages: %s", chat["title"], str(e)[:150])
+            continue
+
+        groups: dict[tuple, list[dict[str, Any]]] = {}
+        for m in msgs:
+            groups.setdefault(_dup_key(m), []).append(m)
+
+        # keep the copy Teams created first
+        extra: list[dict[str, Any]] = []
+        for dupes in groups.values():
+            if len(dupes) > 1:
+                dupes.sort(key=lambda m: m.get("id") or "")
+                extra += dupes[1:]
+
+        if not extra:
+            log.info("%-24s %4d messages, no duplicates", chat["title"], len(msgs))
+            continue
+
+        log.warning("%-24s %4d messages, %d distinct, %d duplicate copies%s",
+                    chat["title"], len(msgs), len(groups), len(extra),
+                    "" if dry_run else " — deleting")
+        if dry_run:
+            total += len(extra)
+            continue
+
+        gone = 0
+        for m in extra:
+            try:
+                gc.soft_delete_chat_message(cid, m["id"])
+                gone += 1
+            except ApiError as e:
+                # Deleting a chat message is delegated-only. An app-only token
+                # gets 405 from /chats/... and 412 "not supported in
+                # application-only context" from /users/{id}/chats/... . No
+                # application permission lifts this, so stop rather than emit
+                # one failure per duplicate.
+                if e.status in (405, 412):
+                    log.error(
+                        "cannot delete chat messages with an application-only "
+                        "token — Graph requires a signed-in user for "
+                        "softDelete (%s). %d duplicates remain.",
+                        e.status, len(extra) - gone)
+                    return total + gone
+                log.error("  could not delete %s: %s", m["id"], str(e)[:150])
+        log.info("%-24s %d duplicates removed", chat["title"], gone)
+        total += gone
+
+    if dry_run:
+        log.info("DRY RUN — %d duplicate copies would be removed; "
+                 "re-run with --apply to delete them", total)
+    return total
+
+
+REOPEN_FLOOR = "2024-01-01T00:00:00Z"
+
+
+def reopen_chats(gc: Any, st: State, cfg: dict[str, Any],
+                 floor: str = REOPEN_FLOOR, only: str | None = None,
+                 dry_run: bool = False) -> int:
+    """Re-run startMigration on already-completed chats with a far-older
+    conversationCreationDateTime, then complete them again.
+
+    Why this exists: the loader backdates a conversation to 24h before its
+    oldest message ([load_dms]). That is enough for the import to succeed and
+    for every message to carry its true Cliq timestamp — `verify-teams` shows
+    the full range and no visibility cutoff blocking it — yet Teams clients were
+    observed rendering only recent history for those chats, while two chats that
+    had been re-opened by hand with a 2024-01-01 creation date rendered in full.
+
+    startMigration requires conversationCreationDateTime to be *strictly older*
+    than the chat's current createdDateTime, so re-running it with the original
+    value is rejected; the floor must be genuinely earlier. Messages are already
+    imported, so this only moves the conversation's start marker — nothing is
+    re-posted and nothing is duplicated.
+
+    Pass dry_run to see what would change without touching Teams.
+    """
+    sql = ("SELECT * FROM chats WHERE teams_chat_id IS NOT NULL "
+           "AND chat_migration='completed'")
+    params: list[Any] = []
+    if only:
+        sql += " AND (zoho_chat_id=? OR title=?)"
+        params += [only, only]
+    chats = st.rows(sql, tuple(params))
+    if not chats:
+        log.warning("no completed chats matched (only=%s)", only)
+        return 0
+
+    oldest_iso = None
+    row = st.one("SELECT MIN(first_msg_ts) t FROM chats WHERE first_msg_ts IS NOT NULL")
+    if row and row["t"]:
+        oldest_iso = iso(row["t"])
+        if floor >= oldest_iso:
+            raise RuntimeError(
+                f"floor {floor} is not older than the oldest message in the "
+                f"archive ({oldest_iso}); pick an earlier date")
+
+    done = 0
+    for chat in chats:
+        cid, tcid = chat["zoho_chat_id"], chat["teams_chat_id"]
+        if dry_run:
+            log.info("would re-open %-26s -> %s", chat["title"], floor)
+            done += 1
+            continue
+        try:
+            gc.start_chat_migration(tcid, floor)
+        except ApiError as e:
+            # Already older than the floor, or Graph refuses — leave it alone.
+            log.error("%-26s could not re-open: %s", chat["title"], e)
+            st.mark("chats", "zoho_chat_id", cid, chat["status"],
+                    note=f"reopen failed: {str(e)[:300]}")
+            continue
+        st.mark("chats", "zoho_chat_id", cid, chat["status"],
+                chat_migration="started")
+        log.info("%-26s re-opened from %s", chat["title"], floor)
+        try:
+            gc.complete_chat_migration(tcid)
+            st.mark("chats", "zoho_chat_id", cid, chat["status"],
+                    chat_migration="completed")
+            done += 1
+        except ApiError as e:
+            # Left 'started' on purpose: complete-dms will retry it, and a chat
+            # stuck in migration mode is visible rather than silently half-done.
+            log.error("%-26s re-opened but completeMigration failed: %s — run "
+                      "`complete-dms`", chat["title"], e)
+    if not dry_run:
+        log.info("%d chats re-opened and completed from %s", done, floor)
+        log.info("check one in the Teams client before trusting the rest")
+    return done
 
 
 def would_skip(st: State, chat: Any, owner_aad_id: str | None) -> bool:
@@ -742,53 +966,156 @@ def import_chat_as_channel(gc: Any, st: State, cfg: dict[str, Any],
     return total
 
 
-def share_group_history(gc: Any, st: State, cfg: dict[str, Any]) -> int:
-    """Make imported messages visible to group chat members.
+READD_ATTEMPTS = 4
 
-    A member's visibleHistoryStartDateTime is set when they are added and can
-    be neither set at creation nor patched later, so imported messages dated
-    before it stay hidden from them. The only remedy Microsoft documents is to
-    remove the member and add them back with the value backdated.
 
-    Removing a member is destructive if the re-add then fails, so each failure
-    is logged with the exact user id needed to repair it by hand."""
+def _readd_member(gc: Any, chat_id: str, uid: str, since: str,
+                  roles: list[str]) -> None:
+    """Add a member back after removal, retrying transient Graph failures.
+
+    This is the dangerous half of the remove-then-add dance: the member is
+    already gone, so giving up here loses them from the conversation. Retry
+    anything retryable before surrendering.
+    """
+    last: ApiError | None = None
+    for attempt in range(READD_ATTEMPTS):
+        try:
+            gc.add_chat_member(chat_id, uid, since, roles)
+            return
+        except ApiError as e:
+            last = e
+            # 409 = already a member again; nothing left to do
+            if e.status == 409:
+                return
+            if e.status not in (429, 500, 502, 503, 504) and attempt:
+                break
+            time.sleep(min(2 ** attempt, 15))
+    if last:
+        raise last
+
+
+def share_history(gc: Any, st: State, cfg: dict[str, Any],
+                  kind: str = "all", only: str | None = None,
+                  floor: str | None = None) -> int:
+    """Make imported messages visible to the people in the chat.
+
+    Every chat member carries a visibleHistoryStartDateTime: the earliest
+    message they are allowed to see. It cannot be set at creation and cannot be
+    patched afterwards, so a member added when the chat was created sees only
+    messages from that moment on — and backdated imported history stays hidden
+    behind it. The only remedy Microsoft documents is to remove the member and
+    add them back with the value backdated.
+
+    This applies to 1:1 chats as much as group chats. A 1:1 chat is usually
+    *resolved* rather than created (create_or_get_chat returns the pair's
+    existing conversation), so its members' cutoff is whenever they first
+    started talking in Teams — which is why a full 18-month import can surface
+    as "only the last few months".
+
+    Removing a member is destructive if the re-add then fails, so re-adds are
+    retried and any final failure is logged with the exact ids needed to repair
+    it by hand.
+    """
     headroom = cfg["teams"]["backdate_headroom_hours"]
-    fixed = 0
+    kinds = ("dm", "group") if kind == "all" else (kind,)
+    placeholders = ",".join("?" * len(kinds))
 
-    for chat in st.rows("SELECT * FROM chats WHERE kind='group' "
-                        "AND teams_chat_id IS NOT NULL"):
+    sql = (f"SELECT * FROM chats WHERE kind IN ({placeholders}) "
+           "AND teams_chat_id IS NOT NULL")
+    params: list[Any] = list(kinds)
+    if only:
+        sql += " AND (zoho_chat_id=? OR title=?)"
+        params += [only, only]
+
+    chats = st.rows(sql, tuple(params))
+    if not chats:
+        log.warning("no chats matched (kind=%s, only=%s)", kind, only)
+        return 0
+
+    fixed = 0
+    for chat in chats:
         cid = chat["teams_chat_id"]
-        # comfortably before the oldest imported message
-        since = backdate(chat["first_msg_ts"], headroom * 2)
+        if not chat["first_msg_ts"]:
+            log.info("%s: no messages, nothing to share", chat["title"])
+            continue
+        # A fixed early floor beats a relative one. Chats whose members sat 24h
+        # before the first message still rendered only recent history in the
+        # Teams client, while chats whose members sat ~18 months before it
+        # rendered in full — so prefer `floor` and keep the relative backdate
+        # only as the fallback.
+        since = floor or backdate(chat["first_msg_ts"], headroom * 2)
 
         try:
             members = gc.list_chat_members(cid)
         except ApiError as e:
-            if e.status == 403:
+            if e.status in (401, 403):
                 log.error("cannot read members of %s: the app needs the "
-                          "ChatMember.ReadWrite.All application permission",
-                          chat["title"])
+                          "ChatMember.ReadWrite.All application permission "
+                          "with admin consent", chat["title"])
                 return fixed
             raise
 
-        log.info("%s: re-sharing history from %s to %d members",
-                 chat["title"], since, len(members))
-        for m in members:
-            uid = m.get("userId")
+        # Only a member whose cutoff is PRESENT and later than the oldest
+        # imported message is hiding history. An absent property means Teams is
+        # not restricting them — notably on oneOnOne chats, where membership is
+        # fixed and both participants see everything. Treating absent as stale
+        # would make us try to remove a member Graph will not let us remove.
+        stale = [m for m in members
+                 if m.get("userId") and m.get("visibleHistoryStartDateTime")
+                 and m["visibleHistoryStartDateTime"] > since]
+        if not stale:
+            log.info("%-28s all %d members already see the full history",
+                     chat["title"], len(members))
+            continue
+
+        # A oneOnOne roster is immutable (see the 403 handler below), so the
+        # remove-then-add remedy cannot run here. Say so once instead of
+        # emitting a wall of identical 403s for every member of every 1:1 chat.
+        if chat["kind"] == "dm":
+            log.warning("%-28s %d member(s) sit at %s, later than the oldest "
+                        "message — but Teams makes a 1:1 roster immutable, so "
+                        "this cannot be fixed here. Use `reopen-chats`, or "
+                        "`import-as-channel` to re-home the conversation.",
+                        chat["title"], len(stale),
+                        min(m["visibleHistoryStartDateTime"] for m in stale)[:10])
+            continue
+
+        log.info("%-28s re-sharing history from %s to %d of %d members",
+                 chat["title"], since, len(stale), len(members))
+        for m in stale:
+            uid = m["userId"]
             name = m.get("displayName") or uid
-            if not uid:
-                continue
-            if m.get("visibleHistoryStartDateTime", "") <= since:
-                log.info("  %s already sees the full history", name)
-                continue
             roles = m.get("roles") or []
+            remaining = len([x for x in gc.list_chat_members(cid)
+                             if x.get("userId")])
+            if remaining <= 1:
+                log.error("  refusing to remove %s: they are the last member "
+                          "of %s and the chat would be lost",
+                          name, chat["title"])
+                continue
             try:
                 gc.remove_chat_member(cid, m["id"])
             except ApiError as e:
-                log.error("  could not remove %s: %s", name, e)
+                # CONFIRMED against Graph 2026-08-01: a oneOnOne chat's roster is
+                # immutable. Removal returns 403 InsufficientPrivileges with
+                # innerError "RosterAddMemberBlocked-Roster is blocked from
+                # remove member", regardless of ChatMember.ReadWrite.All. A 1:1
+                # member's visibleHistoryStartDateTime therefore cannot be
+                # changed after the chat exists — it is fixed by whatever
+                # startMigration set when the conversation was first backdated.
+                # The only way to re-home such a conversation is
+                # import-as-channel, where channels have no per-member cutoff.
+                if chat["kind"] == "dm":
+                    log.error("  %s: Teams blocks membership changes on a 1:1 "
+                              "chat, so its history cutoff cannot be moved (%s). "
+                              "Use `import-as-channel` for this conversation if "
+                              "it genuinely hides history.",
+                              name, str(e)[:180])
+                else:
+                    log.error("  could not remove %s: %s", name, e)
                 continue
             try:
-                gc.add_chat_member(cid, uid, since, roles)
+                _readd_member(gc, cid, uid, since, roles)
                 log.info("  %s re-added with full history", name)
                 fixed += 1
             except ApiError as e:
@@ -796,6 +1123,103 @@ def share_group_history(gc: Any, st: State, cfg: dict[str, Any]) -> int:
                           "    repair by adding user %s back to chat %s",
                           name, e, uid, cid)
     return fixed
+
+
+# kept so existing scripts and the old command name keep working
+share_group_history = share_history
+
+
+def verify_teams(gc: Any, st: State, cfg: dict[str, Any]) -> int:
+    """Read every destination back out of Teams and report what is really there.
+
+    Prints, per destination: the source count, the Teams count, the actual
+    createdDateTime range, and the worst (latest) visibleHistoryStartDateTime
+    across its members. That last column is the one that matters — a chat can
+    hold all 18 months and still show only the last few to the people in it.
+
+    Returns the number of destinations where history is hidden or short.
+    """
+    def day(v: str | None) -> str:
+        return (v or "-")[:10]
+
+    bad = unknown = missing_files = 0
+    denied: set[str] = set()
+
+    rows = st.rows("SELECT * FROM chats WHERE teams_chat_id IS NOT NULL "
+                   "OR teams_channel_id IS NOT NULL ORDER BY kind, title")
+    print(f"{'destination':<26}{'src':>6}{'teams':>6}  {'imported range':<26}"
+          f"{'history visible from':<26}state")
+
+    for c in rows:
+        title = (c["title"] or "")[:25]
+        src = st.one("SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=?"
+                     " AND status='done'", (c["zoho_chat_id"],))["n"]
+
+        vis = "n/a (channel)"
+        try:
+            if c["teams_chat_id"]:
+                n, oldest, newest = gc.chat_message_stats(c["teams_chat_id"])
+                members = gc.list_chat_members(c["teams_chat_id"])
+                # An ABSENT cutoff means Teams is not restricting that member —
+                # it is not the worst case. Treating absent as "9999" made this
+                # report chats as hiding history when they were fully visible.
+                cutoffs = [m["visibleHistoryStartDateTime"] for m in members
+                           if m.get("userId") and m.get("visibleHistoryStartDateTime")]
+                worst = max(cutoffs) if cutoffs else None
+                if worst and oldest and worst > oldest:
+                    vis = f"{day(worst)} HIDES HISTORY"
+                    bad += 1
+                else:
+                    vis = day(worst) if worst else "all"
+            else:
+                n, oldest, newest = gc.channel_message_stats(
+                    c["teams_team_id"], c["teams_channel_id"])
+        except ApiError as e:
+            if e.status in (401, 403):
+                denied.add(str(e.status))
+                print(f"{title:<26}{src:>6}{'403':>6}  {'':<26}"
+                      f"{'cannot read':<22}{c['chat_migration'] or '-'}")
+                unknown += 1
+                continue
+            raise
+
+        if n < src:
+            bad += 1
+        print(f"{title:<26}{src:>6}{n:>6}  "
+              f"{day(oldest) + ' .. ' + day(newest):<26}{vis:<26}"
+              f"{c['chat_migration'] or '-'}")
+
+    print(f"\n{len(rows)} destinations, {bad} with hidden or missing history"
+          + (f", {unknown} unreadable" if unknown else ""))
+
+    # Attachments are the other half of "all the data" — report any that never
+    # reached Teams rather than letting them disappear quietly.
+    f_tot = st.one("SELECT COUNT(*) n, COALESCE(SUM(size),0) b FROM files")
+    f_up = st.one("SELECT COUNT(*) n, COALESCE(SUM(size),0) b FROM files "
+                  "WHERE sp_etag_guid IS NOT NULL")
+    print(f"attachments: {f_up['n']}/{f_tot['n']} in Teams "
+          f"({f_up['b'] / 1e9:.2f} of {f_tot['b'] / 1e9:.2f} GB)")
+    for r in st.rows("SELECT status, error, COUNT(*) n, COALESCE(SUM(size),0) b "
+                     "FROM files WHERE sp_etag_guid IS NULL "
+                     "GROUP BY status, error"):
+        print(f"  {r['n']:>4} not uploaded [{r['status']}] "
+              f"{r['error'] or 'not yet attempted'} ({r['b'] / 1e6:.1f} MB)")
+        missing_files += r["n"]
+    if denied:
+        print("403 = the app can write a chat but not read it back, so those "
+              "rows are UNKNOWN rather than good. Add the ChatMessage.Read.All "
+              "and ChatMember.ReadWrite.All application permissions (admin "
+              "consent) and re-run to actually check them.")
+    if bad:
+        print("run `share-history` to backdate visibleHistoryStartDateTime for "
+              "the rows marked HIDES HISTORY.")
+    if missing_files:
+        print("attachments still queued: run `load-dms` / `load-messages` again "
+              "(re-open the chat first if it is already completed).")
+    if not (bad or unknown or missing_files):
+        print("every destination holds its full history with the original Cliq "
+              "dates, and nothing is hidden from its members.")
+    return bad + unknown + missing_files
 
 
 def verify_dms(gc: Any, st: State) -> int:

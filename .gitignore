@@ -1,1 +1,11 @@
-
+.env
+# real UPNs live here; config.example.yaml is the tracked template
+config.yaml
+# every variant: state.db, -journal, -wal, and hand-made copies like .pilot/.bak
+state.db*
+out/
+mapping/
+__pycache__/
+*.py[cod]
+*.bak*
+.claude/settings.json

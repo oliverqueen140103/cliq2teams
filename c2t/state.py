@@ -216,10 +216,16 @@ class State:
         return self.db.execute(sql, tuple(params)).fetchone()
 
     def pending_messages(self, chat_id: str, limit: int = 500) -> list[sqlite3.Row]:
-        """Ordered by timestamp — required so replies find their parent."""
+        """Messages still to import, oldest first — the order is required so
+        replies find their parent.
+
+        'failed' is terminal alongside 'done' and 'skipped'. A row only reaches
+        'failed' after exhausting its attempts, and re-selecting it would make
+        the caller's batch loop spin forever without ever draining.
+        """
         return self.rows(
             """SELECT * FROM messages
-               WHERE zoho_chat_id=? AND status NOT IN ('done','skipped')
+               WHERE zoho_chat_id=? AND status NOT IN ('done','skipped','failed')
                ORDER BY ts ASC, zoho_msg_id ASC LIMIT ?""",
             (chat_id, limit),
         )

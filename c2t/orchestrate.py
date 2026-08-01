@@ -132,6 +132,17 @@ def run_extract(cfg: dict, st: State) -> None:
 
     gate_extraction_complete(st, cfg)
 
+    # Prove it rather than assume it: re-walk every chat to its first message and
+    # compare with what was stored. This is the guarantee that the archive is
+    # complete, so a shortfall stops the run before anything is loaded.
+    log.info("[4b/6] verifying every chat reaches its first message")
+    short = zoho.verify_extract(zc, st)
+    if short:
+        raise GateFailure(
+            f"{short} chats are missing messages the API still returns. "
+            f"Run `extract-messages --rescan`, then `verify-extract`."
+        )
+
     log.info("[5/6] dump to disk")
     transform.dump(st, cfg)
 

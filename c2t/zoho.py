@@ -23,11 +23,15 @@ log = logging.getLogger(__name__)
 # Endpoint constants — VERIFY THESE
 # --------------------------------------------------------------------------
 # Verified against cliq.zoho.in on 2026-07-30 via `probe`.
+# Re-verified against cliq.zoho.in on 2026-08-01.
+#
+# There is NO working /api/v2/channels/{unique_name}/messages or .../members —
+# both return 404 request_url_invalid for every channel, joined or not. A channel
+# is reachable only through its chat_id, which means a channel reporting
+# chat_id=null cannot be read at all; see extract_chats.
 EP = {
     "channels":         "/api/v2/channels",
     "channel_detail":   "/api/v2/channels/{unique_name}",
-    "channel_members":  "/api/v2/channels/{unique_name}/members",
-    "channel_messages": "/api/v2/channels/{unique_name}/messages",
     "chats":            "/api/v2/chats",
     "chat_detail":      "/api/v2/chats/{chat_id}",
     "chat_messages":    "/api/v2/chats/{chat_id}/messages",
@@ -207,34 +211,41 @@ class ZohoClient:
     def chats(self) -> Iterator[dict[str, Any]]:
         yield from self.paginate(EP["chats"])
 
-    def _message_path(self, chat_id: Any, unique_name: str | None) -> str | None:
-        """Channels the user has never opened report chat_id=null and must be
-        addressed by unique_name through the channel endpoint instead."""
+    @staticmethod
+    def usable_chat_id(chat_id: Any) -> str | None:
+        """Cliq reports chat_id=null (sometimes the literal string "null") for
+        channels the account has never opened. Those are unreachable — there is
+        no unique_name message endpoint to fall back to."""
         cid = str(chat_id or "").strip()
-        if cid and cid.lower() not in ("none", "null", ""):
-            return EP["chat_messages"].format(chat_id=cid)
-        if unique_name:
-            return EP["channel_messages"].format(unique_name=unique_name)
-        return None
+        return cid if cid and cid.lower() not in ("none", "null") else None
+
+    def _message_path(self, chat_id: Any, unique_name: str | None = None) -> str | None:
+        cid = self.usable_chat_id(chat_id)
+        return EP["chat_messages"].format(chat_id=cid) if cid else None
 
     def messages(self, chat_id: str, from_ts: int | None = None,
                  unique_name: str | None = None) -> Iterator[dict[str, Any]]:
-        """Exhaustive message retrieval.
+        """Exhaustive message retrieval — first message to last, always.
 
         The messages endpoint returns bare {"data": [...]} with no next_token
         and no has_more, so token pagination cannot work here. Cliq windows by
         time instead: we walk backwards, repeatedly asking for everything older
-        than the oldest message seen so far, until a page comes back empty.
+        than the oldest message seen so far.
 
-        Dedupes by message id because window boundaries can overlap, and stops
-        on no-progress so a misbehaving endpoint cannot spin forever.
+        The ONLY terminators are an empty page (verified to be the true start of
+        history for all 34 chats on 2026-08-01) and a page that yields no new
+        ids. Deliberately NOT a terminator: a page shorter than `limit`. Cliq
+        does return short pages mid-history, and treating one as the beginning
+        silently truncates the archive — which is the whole thing this tool
+        exists to avoid. A short page costs one extra request to confirm.
         """
-        path = self._message_path(chat_id, unique_name)
+        path = self._message_path(chat_id)
         if path is None:
-            log.error("chat %s: no usable chat_id or unique_name; SKIPPED", chat_id)
+            log.error("chat %s (%s): reports chat_id=null and cannot be read; "
+                      "join the channel in Cliq and re-run extract-chats",
+                      chat_id, unique_name or "?")
             return
         limit = self.page_size
-        alt_tried = False
         seen: set[str] = set()
         totime: int | None = None
         guard = 0
@@ -254,13 +265,6 @@ class ZohoClient:
             try:
                 body = self.http.get(path, params=params)
             except ApiError as e:
-                if (e.status == 400 and not alt_tried and unique_name
-                        and "chats/" in path):
-                    alt_tried = True
-                    path = EP["channel_messages"].format(unique_name=unique_name)
-                    log.info("chat %s: falling back to channel endpoint (%s)",
-                             chat_id, unique_name)
-                    continue
                 if e.status == 400 and "extra_param_found" in e.body and totime is not None:
                     log.error(
                         "chat %s: endpoint rejects 'totime'; retrieved %d messages "
@@ -272,7 +276,7 @@ class ZohoClient:
 
             items = self.extract_items(body, "data")
             if not items:
-                return
+                return                      # the true start of history
 
             fresh = [m for m in items if str(m.get("id")) not in seen]
             if not fresh:
@@ -284,14 +288,14 @@ class ZohoClient:
 
             times = [as_int(m.get("time")) for m in items if m.get("time")]
             if not times:
+                log.warning("chat %s: page of %d messages carries no usable "
+                            "timestamp; cannot page further after %d messages",
+                            chat_id, len(items), len(seen))
                 return
             oldest = min(times)
             if totime is not None and oldest >= totime:
                 return                      # not moving backwards
             totime = oldest - 1
-
-            if len(items) < limit:
-                return                      # short page = start of history
 
     def download_file(self, file_id: str, dest: Path) -> tuple[int, str]:
         """Stream a file to disk. Returns (bytes, sha256)."""
@@ -543,7 +547,7 @@ def extract_users_from_messages(st: State) -> int:
 def extract_chats(cli: ZohoClient, st: State) -> int:
     include = set(cli.cfg["zoho"].get("include_channels") or [])
     exclude = set(cli.cfg["zoho"].get("exclude_channels") or [])
-    n = 0
+    n = unreachable = 0
     with st.tx():
         for ch in cli.channels():
             name = ch.get("name") or ch.get("unique_name") or ""
@@ -551,18 +555,29 @@ def extract_chats(cli: ZohoClient, st: State) -> int:
                 continue
             if name in exclude:
                 continue
-            st.upsert_chat(
-                str(ch.get("chat_id") or ch.get("channel_id") or ch.get("unique_name")),
-                "channel",
-                name,
-                ch.get("unique_name"),
-                as_int(ch.get("participant_count")),
-            )
+
+            cid = cli.usable_chat_id(ch.get("chat_id"))
+            if cid is None:
+                # No unique_name message endpoint exists, so there is no way to
+                # read this channel at all. Record it as skipped with the reason
+                # rather than storing an unusable id that 400s on every page.
+                key = f"unreachable:{ch.get('unique_name') or name}"
+                st.upsert_chat(key, "channel", name, ch.get("unique_name"),
+                               as_int(ch.get("participant_count")))
+                st.mark("chats", "zoho_chat_id", key, "skipped",
+                        note="chat_id=null: join this channel in Cliq, then "
+                             "re-run extract-chats")
+                log.warning("channel %-28s unreachable (chat_id=null) — join it "
+                            "in Cliq and re-run extract-chats", name)
+                unreachable += 1
+                continue
+
+            st.upsert_chat(cid, "channel", name, ch.get("unique_name"),
+                           as_int(ch.get("participant_count")))
             # Zoho's own count -> lets extraction verify it got everything
             st.db.execute(
                 "UPDATE chats SET msg_count_reported=? WHERE zoho_chat_id=?",
-                (as_int(ch.get("total_message_count")),
-                 str(ch.get("chat_id") or ch.get("channel_id") or ch.get("unique_name"))),
+                (as_int(ch.get("total_message_count")), cid),
             )
             n += 1
 
@@ -577,18 +592,48 @@ def extract_chats(cli: ZohoClient, st: State) -> int:
             st.upsert_chat(str(c["chat_id"]), kind, c.get("name"),
                            None, as_int(c.get("participant_count")))
             n += 1
-    st.log("extract-chats", "info", f"{n} chats")
+    st.log("extract-chats", "info",
+           f"{n} chats" + (f", {unreachable} unreachable" if unreachable else ""))
+    if unreachable:
+        log.warning("%d channel(s) cannot be read because Cliq reports "
+                    "chat_id=null for them", unreachable)
     return n
 
 
-def extract_messages(cli: ZohoClient, st: State) -> int:
+def extract_messages(cli: ZohoClient, st: State, rescan: bool = False,
+                     only: str | None = None) -> int:
+    """Walk every chat to its first message.
+
+    Default run: chats already marked 'extracted' are skipped, and a chat that
+    was interrupted resumes from the newest message it already holds.
+
+    rescan=True: re-walk every chat from "now" back to the true start, ignoring
+    the extracted flag. Messages are upserted by id so this is idempotent — it
+    both picks up new activity and re-proves that nothing older is missing.
+    Chats marked 'skipped' (chat_id=null) are never retried; they are
+    unreachable by any endpoint.
+    """
+    if only:
+        chats = st.rows(
+            "SELECT * FROM chats WHERE (zoho_chat_id=? OR title=?) "
+            "AND status != 'skipped'", (only, only))
+        if not chats:
+            raise RuntimeError(f"no chat matching {only!r}")
+    elif rescan:
+        chats = st.rows("SELECT * FROM chats WHERE status != 'skipped'")
+    else:
+        chats = st.rows(
+            "SELECT * FROM chats WHERE status NOT IN ('extracted','skipped')")
+
     total = 0
-    chats = st.rows("SELECT * FROM chats WHERE status != 'extracted'")
     for chat in chats:
         cid = chat["zoho_chat_id"]
-        # resume: continue from the newest message already stored
-        row = st.one("SELECT MAX(ts) m FROM messages WHERE zoho_chat_id=?", (cid,))
-        from_ts = (row["m"] + 1) if row and row["m"] else None
+        if rescan or only:
+            from_ts = None                  # full re-walk to the true start
+        else:
+            # resume: continue from the newest message already stored
+            row = st.one("SELECT MAX(ts) m FROM messages WHERE zoho_chat_id=?", (cid,))
+            from_ts = (row["m"] + 1) if row and row["m"] else None
 
         count = 0
         first_ts = chat["first_msg_ts"]
@@ -607,10 +652,12 @@ def extract_messages(cli: ZohoClient, st: State) -> int:
                     first_ts = m["ts"] if first_ts is None else min(first_ts, m["ts"])
                     last_ts = m["ts"] if last_ts is None else max(last_ts, m["ts"])
                     count += 1
+                stored = st.one(
+                    "SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=?", (cid,))["n"]
                 st.mark(
                     "chats", "zoho_chat_id", cid, "extracted",
                     first_msg_ts=first_ts, last_msg_ts=last_ts,
-                    msg_count_src=(chat["msg_count_src"] or 0) + count,
+                    msg_count_src=stored,
                 )
         except ApiError as e:
             st.mark("chats", "zoho_chat_id", cid, "failed", note=str(e))
@@ -620,16 +667,90 @@ def extract_messages(cli: ZohoClient, st: State) -> int:
         total += count
         got = st.one("SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=?", (cid,))["n"]
         expected = chat["msg_count_reported"] or 0
+        # total_message_count is NOT a message count we can match: Zoho includes
+        # deleted and system entries the API never returns, so it reads low by a
+        # handful on almost every channel. Record the delta, do not cry wolf —
+        # `verify-extract` is the real completeness check.
         if expected and got < expected:
-            log.error("chat %-30s INCOMPLETE: %d/%d messages retrieved",
-                      chat["title"], got, expected)
+            log.info("chat %-30s %d messages (zoho counter says %d; the "
+                     "difference is deleted/system entries the API withholds)",
+                     chat["title"], got, expected)
             st.db.execute(
                 "UPDATE chats SET note=? WHERE zoho_chat_id=?",
-                (f"INCOMPLETE {got}/{expected}", cid))
+                (f"api {got} / counter {expected}", cid))
         else:
-            log.info("chat %-30s %d messages (zoho reports %s)",
+            log.info("chat %-30s %d messages (zoho counter says %s)",
                      chat["title"], got, expected or "?")
     return total
+
+
+def verify_extract(cli: ZohoClient, st: State) -> int:
+    """Re-walk every chat against the live API and prove the database holds all
+    of it, first message to last.
+
+    For each chat this pages backwards to the empty page — the true start of
+    history — and compares the API's message count and oldest timestamp with
+    what is stored. Any chat where the database is short is a failure. Returns
+    the number of such chats, so a non-zero exit means "do not trust this
+    archive yet".
+    """
+    def when(ms_val: Any) -> str:
+        ms = as_int(ms_val)
+        if not ms:
+            return "-"
+        return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000))
+
+    rows = st.rows("SELECT * FROM chats ORDER BY kind, title")
+    print(f"{'chat':<28}{'oldest(api)':>13}{'oldest(db)':>13}"
+          f"{'api':>7}{'db':>7}  verdict")
+    short = 0
+    api_total = db_total = 0
+
+    for c in rows:
+        cid, title = c["zoho_chat_id"], (c["title"] or "")[:27]
+        db_n = st.one("SELECT COUNT(*) n FROM messages WHERE zoho_chat_id=?",
+                      (cid,))["n"]
+        db_oldest = st.one("SELECT MIN(ts) t FROM messages WHERE zoho_chat_id=?",
+                           (cid,))["t"]
+        db_total += db_n
+
+        if c["status"] == "skipped" or cli.usable_chat_id(cid) is None:
+            print(f"{title:<28}{'-':>13}{'-':>13}{'-':>7}{db_n:>7}  "
+                  f"UNREACHABLE ({c['note'] or 'chat_id=null'})")
+            continue
+
+        api_ids: set[str] = set()
+        api_oldest: int | None = None
+        try:
+            for m in cli.messages(cid):
+                api_ids.add(str(m.get("id")))
+                ts = as_int(m.get("time"))
+                if ts and (api_oldest is None or ts < api_oldest):
+                    api_oldest = ts
+        except ApiError as e:
+            print(f"{title:<28}{'-':>13}{when(db_oldest):>13}{'ERR':>7}{db_n:>7}  "
+                  f"API ERROR {e}")
+            short += 1
+            continue
+
+        api_total += len(api_ids)
+        missing = len(api_ids) - db_n
+        if missing > 0:
+            verdict = f"DB SHORT by {missing} — run extract-messages --rescan"
+            short += 1
+        elif api_oldest and db_oldest and db_oldest > api_oldest:
+            verdict = "DB starts too late — run extract-messages --rescan"
+            short += 1
+        else:
+            verdict = "complete"
+        print(f"{title:<28}{when(api_oldest):>13}{when(db_oldest):>13}"
+              f"{len(api_ids):>7}{db_n:>7}  {verdict}")
+
+    print(f"\n{len(rows)} chats — api {api_total}, db {db_total}, "
+          f"{short} incomplete")
+    if not short:
+        print("every reachable chat is stored in full, first message to last.")
+    return short
 
 
 def extract_files(cli: ZohoClient, st: State, blob_dir: Path) -> int:

@@ -4,14 +4,15 @@ zoho:
   rate_limit_rps: 0.3   # Be gentle to avoid 429s on file downloads
   # Only extract these channels. Empty list = all.
   include_channels: []
-  # #LEPU reports chat_id=null and 404s on the unique_name fallback; not wanted.
-  exclude_channels: ["#LEPU", "LEPU"]
+  # Channels reporting chat_id=null are unreachable by any endpoint and are
+  # recorded as skipped automatically — list one here only to silence it.
+  exclude_channels: []
 
 graph:
   rate_limit_rps: 4.0
   max_retries: 8
   # Owner UPN applied to every created team (required by Teams).
-  default_owner_upn: teams email address
+  default_owner_upn: you@yourtenant.com
 
 mapping:
   # How a Zoho user resolves to an AAD user.
@@ -27,7 +28,7 @@ mapping:
   match_display_name: true
   # Fallback identity for messages whose author no longer exists in AAD.
   # Set to null to hard-fail instead.
-  orphan_author_upn: teams email address
+  orphan_author_upn: you@yourtenant.com
 
 teams:
   # Channels are grouped into teams by this rule:
@@ -48,7 +49,7 @@ dms:
 
   # The account these DMs were exported from. Every 1:1 chat is created between
   # this user and the other participant.
-  owner_upn: teams email address
+  owner_upn: you@yourtenant.com
 
   # Import the 4 multi-party Cliq group chats as Teams group chats too.
   # Membership can only be reconstructed from who actually spoke, so this is
@@ -59,7 +60,9 @@ dms:
   # none -> import the message text only, naming the file inline
   attachments: link
   onedrive_folder: "Cliq Archive"
-  # Skip anything larger than this (0 = no limit). The largest DM blob is 362 MB.
+  # 0 = no limit, and that is what you want for a complete archive. Graph
+  # switches to a resumable upload session above 4 MB, so size is not a problem.
+  # Any non-zero value DROPS files, and `verify-teams` reports them as missing.
   max_attachment_mb: 0
 
 paths:

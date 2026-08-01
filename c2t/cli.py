@@ -31,12 +31,61 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="c2t", description="Zoho Cliq -> Microsoft Teams migration")
     ap.add_argument("-c", "--config", default="config.yaml")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("init", "extract-users", "extract-chats", "extract-messages",
+    for c in ("init", "extract-users", "extract-chats",
               "extract-files", "map-users", "plan", "load-teams", "load-messages",
-              "export-dms", "complete", "verify", "status",
-              "plan-dms", "complete-dms", "verify-dms", "status-dms",
-              "share-group-history"):
+              "export-dms", "complete", "verify", "verify-extract",
+              "verify-teams", "status",
+              "plan-dms", "verify-dms", "status-dms"):
         sub.add_parser(c)
+    em = sub.add_parser("extract-messages",
+                        help="walk every chat back to its first message")
+    em.add_argument("--rescan", action="store_true",
+                    help="re-walk chats already marked extracted, from now back "
+                         "to the true start — idempotent, picks up new messages "
+                         "and re-proves nothing old is missing")
+    em.add_argument("--only", default=None,
+                    help="a single chat title or Zoho chat id (implies --rescan)")
+    cd = sub.add_parser("complete-dms",
+                        help="take chats out of migration mode — until this "
+                             "succeeds Teams shows the 'migration in progress' "
+                             "banner and hides older messages")
+    cd.add_argument("--force", action="store_true",
+                    help="re-issue completeMigration even for chats this "
+                         "database already calls completed; a 204 means the "
+                         "chat was in fact still open")
+    dd = sub.add_parser("dedupe-chats",
+                        help="soft-delete duplicate copies left by repeated "
+                             "import runs (dry run unless --apply)")
+    dd.add_argument("--only", default=None,
+                    help="a single chat title or Zoho chat id")
+    dd.add_argument("--apply", action="store_true",
+                    help="actually delete; without this it only reports")
+    ro = sub.add_parser("reopen-chats",
+                        help="re-run startMigration on completed chats with a "
+                             "far-older creation date so clients render the "
+                             "whole history")
+    ro.add_argument("--floor", default=None,
+                    help="ISO8601 conversationCreationDateTime to set "
+                         "(default 2024-01-01T00:00:00Z); must be strictly "
+                         "older than every message in the archive")
+    ro.add_argument("--only", default=None,
+                    help="a single chat title or Zoho chat id — pilot with this")
+    ro.add_argument("--dry-run", action="store_true",
+                    help="show what would change without touching Teams")
+    sh = sub.add_parser("share-history",
+                        aliases=["share-group-history"],
+                        help="make imported history visible: re-add chat members "
+                             "with a backdated visibleHistoryStartDateTime")
+    sh.add_argument("--kind", choices=["dm", "group", "all"], default="all",
+                    help="which chats to fix (default: all)")
+    sh.add_argument("--only", default=None,
+                    help="a single chat title or Zoho chat id")
+    sh.add_argument("--floor", default=None,
+                    help="set every member's visibleHistoryStartDateTime to this "
+                         "ISO8601 date instead of 48h before the oldest message "
+                         "(e.g. 2024-01-01T00:00:00Z). Chats whose members sit "
+                         "well before the first message are the ones that render "
+                         "full history in the Teams client")
     ac = sub.add_parser("import-as-channel",
                         help="import one chat into a Teams channel instead of a "
                              "chat — for bot chats and departed users")
@@ -109,7 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         elif cmd == "extract-chats":
             print(f"{zoho.extract_chats(zc, st)} chats")
         elif cmd == "extract-messages":
-            print(f"{zoho.extract_messages(zc, st)} messages")
+            n = zoho.extract_messages(zc, st, rescan=args.rescan, only=args.only)
+            print(f"{n} messages")
         elif cmd == "extract-files":
             print(f"{zoho.extract_files(zc, st, Path(cfg['paths']['blob_dir']))} files")
 
@@ -189,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
 
     elif cmd == "complete-dms":
         from . import chats, graph
-        print(f"{chats.complete_dms(graph.GraphClient(cfg), st)} chats completed")
+        n = chats.complete_dms(graph.GraphClient(cfg), st, force=args.force)
+        print(f"{n} chats completed")
 
     elif cmd == "bundle-chat":
         from . import chats
@@ -201,10 +252,36 @@ def main(argv: list[str] | None = None) -> int:
                                          args.chat, args.name)
         print(f"{n} messages imported into the channel")
 
-    elif cmd == "share-group-history":
+    elif cmd == "dedupe-chats":
         from . import chats, graph
-        n = chats.share_group_history(graph.GraphClient(cfg), st, cfg)
-        print(f"{n} group chat memberships re-shared with full history")
+        n = chats.dedupe_chats(graph.GraphClient(cfg), st, only=args.only,
+                               dry_run=not args.apply)
+        print(f"{n} duplicate copies {'found' if not args.apply else 'removed'}")
+
+    elif cmd == "reopen-chats":
+        from . import chats, graph
+        n = chats.reopen_chats(graph.GraphClient(cfg), st, cfg,
+                               floor=args.floor or chats.REOPEN_FLOOR,
+                               only=args.only, dry_run=args.dry_run)
+        print(f"{n} chats {'would be' if args.dry_run else ''} re-opened")
+
+    elif cmd in ("share-history", "share-group-history"):
+        from . import chats, graph
+        n = chats.share_history(graph.GraphClient(cfg), st, cfg,
+                                kind=args.kind, only=args.only, floor=args.floor)
+        print(f"{n} chat memberships re-shared with full history")
+
+    elif cmd == "verify-extract":
+        zc = zoho.ZohoClient(cfg)
+        short = zoho.verify_extract(zc, st)
+        st.close()
+        return 1 if short else 0
+
+    elif cmd == "verify-teams":
+        from . import chats, graph
+        bad = chats.verify_teams(graph.GraphClient(cfg), st, cfg)
+        st.close()
+        return 1 if bad else 0
 
     elif cmd == "verify-dms":
         from . import chats, graph
