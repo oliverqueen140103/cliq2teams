@@ -109,6 +109,7 @@ Running both is reasonable: the HTML transcript stays the fallback record.
    Files.ReadWrite.All
    User.Read.All
    Sites.ReadWrite.All
+   ChatMessage.Read.All
    ```
 3. Client secret or certificate.
 4. Teams licences assigned to every target user *before* load — messages
