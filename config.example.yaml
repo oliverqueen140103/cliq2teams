@@ -11,7 +11,7 @@ graph:
   rate_limit_rps: 4.0
   max_retries: 8
   # Owner UPN applied to every created team (required by Teams).
-  default_owner_upn: varagunarajan@lifesigns.us
+  default_owner_upn: teams email address
 
 mapping:
   # How a Zoho user resolves to an AAD user.
@@ -27,7 +27,7 @@ mapping:
   match_display_name: true
   # Fallback identity for messages whose author no longer exists in AAD.
   # Set to null to hard-fail instead.
-  orphan_author_upn: varagunarajan@lifesigns.us
+  orphan_author_upn: teams email address
 
 teams:
   # Channels are grouped into teams by this rule:
@@ -48,7 +48,7 @@ dms:
 
   # The account these DMs were exported from. Every 1:1 chat is created between
   # this user and the other participant.
-  owner_upn: Varagunarajan@lifesigns.us
+  owner_upn: teams email address
 
   # Import the 4 multi-party Cliq group chats as Teams group chats too.
   # Membership can only be reconstructed from who actually spoke, so this is
