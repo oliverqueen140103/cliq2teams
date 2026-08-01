@@ -168,7 +168,9 @@ Running both is reasonable: the HTML transcript stays the fallback record.
    ChatMessage.Read.All                  verify-teams / verify-dms on chats
    Chat.Read.All                         reading a chat's createdDateTime
    ChatMember.ReadWrite.All              share-history
-   ```
+   Chat.ManageDeletion.All
+   
+   ``
    The last four are easy to miss: import succeeds without them, but you cannot
    read a chat back to check it, cannot see whether the conversation was actually
    backdated, and cannot fix hidden history (§1.2). An unverified migration is how
