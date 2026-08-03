@@ -216,6 +216,7 @@ python -m c2t load-teams              # migration-mode teams + channels
 python -m c2t load-messages           # the slow part
 python -m c2t complete                # completeMigration + add members
 python -m c2t verify                  # count reconciliation
+python make_private.py                # OPTIONAL: strip all non-owner members to make Team 100% private
 ```
 
 DMs are a separate, independent track — nothing below touches the channel team:
@@ -241,6 +242,7 @@ Three of these are not optional:
 - **`verify-teams`** is what proves the outcome and what you hand to whoever
   signed off: real Teams counts, real `createdDateTime` ranges, per-member
   visibility cutoffs, and an attachment reconciliation.
+- **`make_private.py`** is an optional utility to strip out all non-owner organization members from the created Team(s), keeping the archive team and its channels 100% private to the owner account.
 
 `run --phase extract` chains the extract half unattended and gates on
 `verify-extract` before anything is loaded.

@@ -94,12 +94,6 @@ class GraphClient:
             "description": description or f"Migrated from Zoho Cliq",
             "createdDateTime": created_dt,
         }
-        if owner_upn:
-            owner = self.find_user(owner_upn)
-            if owner:
-                body["owners@odata.bind"] = [
-                    f"{GRAPH}/users('{owner['id']}')"
-                ]
         resp = self.http.post("/teams", json=body)
         # 202 Accepted; the team id is in the Location header
         loc = resp.headers.get("Location", "")
